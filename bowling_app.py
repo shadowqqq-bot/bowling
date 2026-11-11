@@ -7,8 +7,7 @@ from github import Github
 from io import StringIO
 
 st.set_page_config(page_title="볼링 에버리지 트래커", page_icon="🎳", layout="wide")
-st.title("🎳 김형용 - 볼링에버리지 관리")
-
+st.markdown("<h1 style='font-size: 22px;'>🎳 김형용 - 볼링 에버리지 기록 & 분석</h1>", unsafe_allow_html=True)
 DATA_FILE = "bowling_records.csv"
 
 def get_github_repo():
