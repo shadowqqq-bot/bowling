@@ -143,7 +143,7 @@ else:
             df_cum_plot,
             x='Game_Number',
             y=['점수', '에버리지 변화'],
-            title="전 게임 점수 및 누적 에버리지",
+            title="게임 점수 및 누적 에버리지",
             markers=True,
             labels={
                 'Game_Number': '누적 게임 순서',
