@@ -85,15 +85,17 @@ else:
 
     df_p = df.copy()
     if period_option == "날짜별":
-        df_p['Period'] = df_p['Date'].dt.strftime('%Y-%m-%d')
+        # 년도-월-일 한글 표기 (예: 2026년 11월 11일)
+        df_p['Period'] = df_p['Date'].dt.strftime('%Y년 %m월 %d일')
     elif period_option == "주별":
-        df_p['Period'] = df_p['Date'].dt.to_period('W').apply(lambda r: r.start_time.strftime('%Y-%m-%d(주)'))
+        df_p['Period'] = df_p['Date'].dt.to_period('W').apply(lambda r: r.start_time.strftime('%Y년 %m월 %d일(주간)'))
     elif period_option == "월별":
-        df_p['Period'] = df_p['Date'].dt.strftime('%Y-%m')
+        df_p['Period'] = df_p['Date'].dt.strftime('%Y년 %m월')
     else:
         df_p['Period'] = df_p['Date'].dt.strftime('%Y년')
 
-    stats_df = df_p.groupby('Period').agg(
+    # 정렬이 흐트러지지 않도록 등장 순서 유지(sort=False)
+    stats_df = df_p.groupby('Period', sort=False).agg(
         게임수=('Score', 'count'),
         에버리지=('Score', 'mean'),
         최고점수=('Score', 'max'),
@@ -104,18 +106,69 @@ else:
     tab1, tab2, tab3 = st.tabs(["📈 그래프", "📋 기록 조회 및 수정", "🏢 볼링장별"])
 
     with tab1:
+        # 1. 기간별 에버리지 추이 그래프
         fig_p = go.Figure()
-        fig_p.add_trace(go.Scatter(x=stats_df['Period'], y=stats_df['에버리지'], mode='lines+markers+text', name='기간 평균', text=stats_df['에버리지'], textposition='top center', line=dict(color='#1f77b4', width=3)))
-        fig_p.add_trace(go.Bar(x=stats_df['Period'], y=stats_df['게임수'], name='게임 수', yaxis='y2', opacity=0.2, marker_color='gray'))
-        fig_p.update_layout(title=f"{period_option} 에버리지 추이", yaxis=dict(title="에버리지", range=[0, 310]), yaxis2=dict(title="게임 수", overlaying='y', side='right', showgrid=False), hovermode="x unified")
+        fig_p.add_trace(go.Scatter(
+            x=stats_df['Period'], y=stats_df['에버리지'],
+            mode='lines+markers+text', name='기간 평균',
+            text=stats_df['에버리지'], textposition='top center',
+            line=dict(color='#1f77b4', width=3)
+        ))
+        fig_p.add_trace(go.Bar(
+            x=stats_df['Period'], y=stats_df['게임수'],
+            name='게임 수', yaxis='y2', opacity=0.2, marker_color='gray'
+        ))
+        # xaxis_type='category'를 지정하여 영어 날짜(Nov 11 등)로 자동 변환되는 현상 방지
+        fig_p.update_layout(
+            title=f"{period_option} 에버리지 추이",
+            xaxis=dict(title="기간", type='category'),
+            yaxis=dict(title="에버리지", range=[0, 310]),
+            yaxis2=dict(title="게임 수", overlaying='y', side='right', showgrid=False),
+            hovermode="x unified"
+        )
         st.plotly_chart(fig_p, use_container_width=True)
 
-        fig_cum = px.line(df, x='Game_Number', y=['Score', 'Cumulative_Avg'], title="전 게임 점수 및 누적 에버리지", markers=True)
+        st.divider()
+
+        # 2. 전 게임 점수 및 누적 에버리지 그래프 (선 색상 선택 기능 포함)
+        col_color1, col_color2, _ = st.columns([1, 1, 4])
+        with col_color1:
+            score_color = st.color_picker("🎨 '점수' 선 색상 선택", "#83C9FF")
+        with col_color2:
+            avg_color = st.color_picker("🎨 '에버리지 변화' 선 색상 선택", "#FF4B4B")
+
+        # 범례 이름을 한글('점수', '에버리지 변화')로 변경하기 위해 데이터프레임 컬럼명 매핑
+        df_cum_plot = df.rename(columns={
+            'Score': '점수',
+            'Cumulative_Avg': '에버리지 변화'
+        })
+
+        fig_cum = px.line(
+            df_cum_plot,
+            x='Game_Number',
+            y=['점수', '에버리지 변화'],
+            title="전 게임 점수 및 누적 에버리지",
+            markers=True,
+            labels={
+                'Game_Number': '누적 게임 순서',
+                'value': '점수',
+                'variable': '구분'
+            },
+            color_discrete_map={
+                '점수': score_color,
+                '에버리지 변화': avg_color
+            }
+        )
+        fig_cum.update_layout(
+            yaxis=dict(title="점수", range=[0, 310]),
+            hovermode="x unified"
+        )
         st.plotly_chart(fig_cum, use_container_width=True)
 
     with tab2:
         st.subheader(f"📊 {period_option} 요약 통계")
-        st.dataframe(stats_df.sort_values(by='Period', ascending=False), use_container_width=True, hide_index=True)
+        # 최근 기간이 위로 오도록 역순 출력
+        st.dataframe(stats_df.iloc[::-1], use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("✏️ 전체 기록 수정 및 삭제")
@@ -125,7 +178,7 @@ else:
         edit_df['Date'] = edit_df['Date'].dt.date
 
         col_cfg = {
-            "Date": st.column_config.DateColumn("날짜", required=True),
+            "Date": st.column_config.DateColumn("날짜", format="YYYY-MM-DD", required=True),
             "Alley": st.column_config.TextColumn("볼링장", default="덕우스핀볼링장", required=True),
             "Score": st.column_config.NumberColumn("점수", min_value=0, max_value=300, step=1, required=True)
         }
