@@ -7,7 +7,7 @@ from github import Github
 from io import StringIO
 
 st.set_page_config(page_title="볼링 에버리지 트래커", page_icon="🎳", layout="wide")
-st.title("🎳 볼링 에버리지 기록 & 분석기")
+st.title("🎳 김형용 - 볼링에버리지 관리")
 
 DATA_FILE = "bowling_records.csv"
 
