@@ -85,7 +85,6 @@ else:
 
     df_p = df.copy()
     if period_option == "날짜별":
-        # 년도-월-일 한글 표기 (예: 2026년 11월 11일)
         df_p['Period'] = df_p['Date'].dt.strftime('%Y년 %m월 %d일')
     elif period_option == "주별":
         df_p['Period'] = df_p['Date'].dt.to_period('W').apply(lambda r: r.start_time.strftime('%Y년 %m월 %d일(주간)'))
@@ -94,7 +93,6 @@ else:
     else:
         df_p['Period'] = df_p['Date'].dt.strftime('%Y년')
 
-    # 정렬이 흐트러지지 않도록 등장 순서 유지(sort=False)
     stats_df = df_p.groupby('Period', sort=False).agg(
         게임수=('Score', 'count'),
         에버리지=('Score', 'mean'),
@@ -118,7 +116,6 @@ else:
             x=stats_df['Period'], y=stats_df['게임수'],
             name='게임 수', yaxis='y2', opacity=0.2, marker_color='gray'
         ))
-        # xaxis_type='category'를 지정하여 영어 날짜(Nov 11 등)로 자동 변환되는 현상 방지
         fig_p.update_layout(
             title=f"{period_option} 에버리지 추이",
             xaxis=dict(title="기간", type='category'),
@@ -137,7 +134,6 @@ else:
         with col_color2:
             avg_color = st.color_picker("🎨 '에버리지 변화' 선 색상 선택", "#FF4B4B")
 
-        # 범례 이름을 한글('점수', '에버리지 변화')로 변경하기 위해 데이터프레임 컬럼명 매핑
         df_cum_plot = df.rename(columns={
             'Score': '점수',
             'Cumulative_Avg': '에버리지 변화'
@@ -159,7 +155,10 @@ else:
                 '에버리지 변화': avg_color
             }
         )
+        # showlegend=False 로 우측 범례를 제거하고 우측 여백(r=10)을 줄여 X축 폭 최대화
         fig_cum.update_layout(
+            showlegend=False,
+            margin=dict(l=20, r=10, t=50, b=20),
             yaxis=dict(title="점수", range=[0, 310]),
             hovermode="x unified"
         )
@@ -167,7 +166,6 @@ else:
 
     with tab2:
         st.subheader(f"📊 {period_option} 요약 통계")
-        # 최근 기간이 위로 오도록 역순 출력
         st.dataframe(stats_df.iloc[::-1], use_container_width=True, hide_index=True)
 
         st.divider()
