@@ -14,7 +14,7 @@ DATA_FILE = "bowling_records.csv"
 # 깃허브 연동 설정 (Streamlit Secrets 활용)
 def get_github_repo():
     token = st.secrets["GITHUB_TOKEN"]
-    repo_name = st.secrets["REPO_NAME"] # 예: "홍길동/bowling-tracker"
+    repo_name = st.secrets["REPO_NAME"]
     g = Github(token)
     return g.get_repo(repo_name)
 
@@ -28,29 +28,30 @@ def load_data():
         df['Date'] = pd.to_datetime(df['Date'])
         return df, file_content.sha
     except Exception:
-        # 파일이 아직 없으면 빈 표 생성
         return pd.DataFrame(columns=['Date', 'Alley', 'Score']), None
 
 # 2. 깃허브에 데이터 자동 저장(Commit)하기
-def save_data(df, sha):
+def save_data(df, sha, commit_msg="볼링 점수 업데이트"):
     repo = get_github_repo()
     df_to_save = df.copy()
-    df_to_save['Date'] = df_to_save['Date'].dt.strftime('%Y-%m-%d')
+    if not df_to_save.empty:
+        df_to_save['Date'] = pd.to_datetime(df_to_save['Date']).dt.strftime('%Y-%m-%d')
     csv_content = df_to_save.to_csv(index=False)
     
     if sha:
-        repo.update_file(DATA_FILE, "볼링 점수 업데이트", csv_content, sha)
+        repo.update_file(DATA_FILE, commit_msg, csv_content, sha)
     else:
         repo.create_file(DATA_FILE, "첫 볼링 점수 기록 생성", csv_content)
 
 df, file_sha = load_data()
 
-# 3. 사이드바: 점수 입력 폼 (아이폰에서는 좌측 상단 '>' 버튼으로 열림)
+# 3. 사이드바: 점수 입력 폼
 with st.sidebar:
     st.header("📝 새 게임 기록 추가")
     with st.form("record_form", clear_on_submit=True):
         input_date = st.date_input("날짜", datetime.today())
-        input_alley = st.text_input("볼링장 이름", placeholder="예: 스타볼링장")
+        # 기본값으로 '덕우스핀볼링장' 고정 (다른 곳일 때만 수정)
+        input_alley = st.text_input("볼링장 이름", value="덕우스핀볼링장")
         input_scores = st.text_input("점수 (여러 게임은 쉼표로 구분)", placeholder="예: 180, 205, 190")
         
         submitted = st.form_submit_button("기록 저장")
@@ -60,14 +61,18 @@ with st.sidebar:
             if not scores:
                 st.error("0~300 사이의 올바른 점수를 입력해 주세요.")
             else:
-                alley_name = input_alley.strip() if input_alley.strip() != "" else "미지정"
+                alley_name = input_alley.strip() if input_alley.strip() != "" else "덕우스핀볼링장"
                 new_rows = pd.DataFrame({
                     'Date': [pd.to_datetime(input_date)] * len(scores),
                     'Alley': [alley_name] * len(scores),
                     'Score': scores
                 })
-                df = pd.concat([df, new_rows], ignore_index=True)
-                save_data(df, file_sha)
+                if df.empty:
+                    df = new_rows
+                else:
+                    df = pd.concat([df, new_rows], ignore_index=True)
+                
+                save_data(df, file_sha, "새 볼링 점수 추가")
                 st.success(f"{len(scores)}게임 저장 완료!")
                 st.rerun()
 
@@ -75,6 +80,7 @@ with st.sidebar:
 if df.empty:
     st.info("아직 등록된 볼링 기록이 없습니다. 왼쪽 상단 `[>]` 메뉴를 열어 첫 점수를 입력해 보세요!")
 else:
+    df['Date'] = pd.to_datetime(df['Date'])
     df = df.sort_values(by='Date').reset_index(drop=True)
     df['Game_Number'] = df.index + 1
     df['Cumulative_Avg'] = df['Score'].expanding().mean().round(1)
@@ -107,7 +113,7 @@ else:
     ).reset_index()
     stats_df['에버리지'] = stats_df['에버리지'].round(1)
 
-    tab1, tab2, tab3 = st.tabs(["📈 그래프", "📋 상세 표", "🏢 볼링장별"])
+    tab1, tab2, tab3 = st.tabs(["📈 그래프", "📋 기록 조회 및 수정", "🏢 볼링장별"])
 
     with tab1:
         fig_period = go.Figure()
@@ -124,21 +130,4 @@ else:
         fig_period.update_layout(
             title=f"{period_option} 에버리지 추이",
             yaxis=dict(title="에버리지", range=[0, 310]),
-            yaxis2=dict(title="게임 수", overlaying='y', side='right', showgrid=False),
-            hovermode="x unified"
-        )
-        st.plotly_chart(fig_period, use_container_width=True)
-
-        fig_cum = px.line(
-            df, x='Game_Number', y=['Score', 'Cumulative_Avg'],
-            title="전 게임 점수 및 누적 에버리지", markers=True
-        )
-        st.plotly_chart(fig_cum, use_container_width=True)
-
-    with tab2:
-        st.dataframe(stats_df.sort_values(by='Period', ascending=False), use_container_width=True, hide_index=True)
-
-    with tab3:
-        alley_stats = df.groupby('Alley').agg(게임수=('Score', 'count'), 에버리지=('Score', 'mean'), 최고점수=('Score', 'max')).reset_index()
-        alley_stats['에버리지'] = alley_stats['에버리지'].round(1)
-        st.dataframe(alley_stats, use_container_width=True, hide_index=True)
+            yaxis
