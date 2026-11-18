@@ -547,7 +547,8 @@ with tab6:
             st.rerun()
 # ───────────────────────── 구속 측정 헬퍼 ─────────────────────────
 MODE_MANUAL = "✋ 수동 (영상 보며 지정)"
-MODE_AUTO = "🤖 자동 (영상 분석)"
+MODE_TRACK = "🎯 자동 (공 추적)"
+MODE_AUTO = "🤖 자동 (영역 변화 감지)"
 MODE_DIRECT = "⌨️ 시간 직접 입력"
 VIDEO_TYPES = ["mp4", "mov", "avi", "m4v", "mkv"]
 
@@ -569,6 +570,7 @@ def spd_store_video(uploaded):
         st.session_state.update(spd_vid_key=key, spd_vid_path=tmp.name,
                                 spd_frame=0, spd_t_start=0.0, spd_t_end=0.0)
         st.session_state.pop("spd_series", None)
+        st.session_state.pop("trk_res", None)
     return st.session_state["spd_vid_path"]
 
 
@@ -664,6 +666,128 @@ def spd_detect(idxs, ma, mb, thr_a, thr_b):
     return int(idxs[a]), (int(idxs[b]) if b is not None else None)
 
 
+def spd_draw_lines(frame_rgb, y_foul, y_pin, lane_x, chain=None):
+    """기준선(파울라인/1번 핀), 레인 범위, (선택) 추적된 공 궤적을 그린다."""
+    img = frame_rgb.copy()
+    h, w = img.shape[:2]
+    th = max(2, w // 300)
+    for y, color in ((y_foul, (30, 144, 255)), (y_pin, (255, 140, 0))):
+        yy = int(h * y / 100)
+        cv2.line(img, (0, yy), (w, yy), color, th)
+    for x in lane_x:
+        xx = int(w * x / 100)
+        cv2.line(img, (xx, 0), (xx, h), (60, 200, 60), th)
+    if chain:
+        pts = [(int(w * c[1] / 100), int(h * c[2] / 100)) for c in chain]
+        for p, q in zip(pts[:-1], pts[1:]):
+            cv2.line(img, p, q, (255, 0, 0), max(1, th // 2))
+        for p in pts:
+            cv2.circle(img, p, max(3, w // 160), (255, 0, 0), -1)
+    return img
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def spd_track(path, lane_x, y_foul, y_pin, d_rng, var_thr, f_lo, f_hi):
+    """배경 제거로 움직이는 물체를 찾고, 공 크기·모양에 맞는 후보 (프레임, x%, y%)를 모은다."""
+    cap = cv2.VideoCapture(path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(f_lo))
+    sub = cv2.createBackgroundSubtractorMOG2(history=150, varThreshold=float(var_thr), detectShadows=False)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    y_lo, y_hi = sorted((y_foul, y_pin))
+    margin = 6.0  # 기준선 바깥도 조금 포함해 보간 정확도를 높임
+    cands = []
+    i = int(f_lo)
+    while i <= int(f_hi):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        w0 = frame.shape[1]
+        if w0 > 480:
+            frame = cv2.resize(frame, None, fx=480.0 / w0, fy=480.0 / w0, interpolation=cv2.INTER_AREA)
+        h, w = frame.shape[:2]
+        gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+        mask = sub.apply(gray)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        a_min = np.pi / 4 * (d_rng[0] / 100 * w) ** 2
+        a_max = np.pi / 4 * (d_rng[1] / 100 * w) ** 2
+        found = []
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area < a_min or area > a_max:
+                continue
+            per = cv2.arcLength(c, True)
+            if per <= 0:
+                continue
+            circ = 4 * np.pi * area / (per * per)
+            _, _, bw, bh = cv2.boundingRect(c)
+            if circ < 0.3 or max(bw, bh) / max(1, min(bw, bh)) > 3.0:
+                continue
+            m = cv2.moments(c)
+            if m["m00"] == 0:
+                continue
+            cx, cy = m["m10"] / m["m00"] / w * 100, m["m01"] / m["m00"] / h * 100
+            if not (lane_x[0] <= cx <= lane_x[1] and y_lo - margin <= cy <= y_hi + margin):
+                continue
+            found.append((circ, i, cx, cy))
+        found.sort(reverse=True)
+        cands.extend((f, cx, cy) for _, f, cx, cy in found[:3])
+        i += 1
+    cap.release()
+    return cands
+
+
+def spd_chain(cands, y_foul, y_pin, gap_max=4):
+    """후보들 중 핀 방향으로 꾸준히 전진하는 가장 긴 궤적(공)을 찾는다. 정지한 잡음은 전진량이 없어 탈락."""
+    if len(cands) < 4:
+        return []
+    direction = 1.0 if y_pin > y_foul else -1.0
+    pts = sorted(cands)
+    n = len(pts)
+    score = [0.0] * n
+    prev = [-1] * n
+    for j in range(n):
+        fj, xj, yj = pts[j]
+        for i in range(j - 1, -1, -1):
+            fi, xi, yi = pts[i]
+            gap = fj - fi
+            if gap > gap_max:
+                break
+            if gap < 1:
+                continue
+            dy = (yj - yi) * direction
+            if dy < 0.02 or dy > 8.0 * gap or abs(xj - xi) > 6.0 * gap:
+                continue
+            s = score[i] + dy + 0.001
+            if s > score[j]:
+                score[j] = s
+                prev[j] = i
+    j = int(np.argmax(score))
+    chain = []
+    while j != -1:
+        chain.append(pts[j])
+        j = prev[j]
+    return chain[::-1]
+
+
+def spd_cross(chain, y_foul, y_pin, fps):
+    """궤적을 곡선으로 맞춰 기준선을 지나는 시각을 프레임 사이까지 보간. 범위 밖이면 끝부분 직선으로 추정."""
+    arr = np.array(chain, dtype=float)
+    t = arr[:, 0] / fps
+    y = arr[:, 2]
+    coef = np.polyfit(y, t, 2 if len(arr) >= 8 else 1)
+    out = []
+    for yl in (y_foul, y_pin):
+        if y.min() <= yl <= y.max():
+            out.append((float(np.polyval(coef, yl)), False))
+        else:
+            near = np.argsort(np.abs(y - yl))[:8]
+            c1 = np.polyfit(y[near], t[near], 1)
+            out.append((float(np.polyval(c1, yl)), True))
+    return out
+
+
 def spd_step(delta):
     n = st.session_state.get("spd_nframes", 1)
     st.session_state["spd_frame"] = int(min(max(st.session_state.get("spd_frame", 0) + delta, 0), n - 1))
@@ -708,7 +832,7 @@ with tab7:
             value=1.0, step=1.0, key="spd_slow",
             help="240fps 슬로모션을 30fps로 저장한 영상처럼 실제보다 N배 느리게 재생되는 영상이면 N을 입력하세요. 실제 시간 = 영상 시간 ÷ 배율")
 
-    mode = st.radio("측정 방식", [MODE_MANUAL, MODE_AUTO, MODE_DIRECT], horizontal=True, key="spd_mode")
+    mode = st.radio("측정 방식", [MODE_TRACK, MODE_MANUAL, MODE_AUTO, MODE_DIRECT], horizontal=True, key="spd_mode")
 
     video_ok, video_path, up, info = False, None, None, None
     fps = 0.0
@@ -778,7 +902,86 @@ with tab7:
                 th2.image(im_e, caption=f"핀 타격 ({t_end:.3f} 초)")
         elapsed = t_end - t_start
 
-    # ── 자동 ──
+    # ── 자동 (공 추적) ──
+    elif mode == MODE_TRACK and video_ok:
+        method_label = "자동(추적)"
+        n = info["n"]
+        duration = n / fps
+        st.markdown("**① 기준선 지정** — 🟦 파란 선: 파울라인 · 🟧 주황 선: 1번 핀 위치 · 🟩 초록 세로선: 공이 지나가는 레인 범위. "
+                    "카메라는 고정되어 있어야 하고, 두 선은 레인과 직각(수평)이 되도록 맞춰 주세요.")
+        tl1, tl2 = st.columns(2)
+        with tl1:
+            y_foul = st.slider("파울라인 높이 (%, 화면 맨 위 = 0)", 0, 100, 88, key="trk_yf")
+            y_pin = st.slider("1번 핀 높이 (%)", 0, 100, 18, key="trk_yp")
+        with tl2:
+            lane_x = st.slider("레인 가로 범위 (%)", 0, 100, (25, 75), key="trk_x")
+            d_rng = st.slider("공 지름 범위 (화면 가로 대비 %)", 0.5, 12.0, (1.0, 6.0), 0.1, key="trk_d",
+                              help="가까울 때 가장 크고 핀 쪽으로 갈수록 작아지니, 두 경우를 모두 포함하도록 넓게 잡으세요.")
+        trk_ref = st.slider("미리보기 프레임", 0, n - 1, 0, key="trk_ref")
+        ref_img = spd_read_frame(video_path, trk_ref)
+        if ref_img is not None:
+            st.image(spd_draw_lines(ref_img, y_foul, y_pin, lane_x), caption="기준선 미리보기")
+
+        st.markdown("**② 분석 설정**")
+        t_lo, t_hi = st.slider("분석 구간 (초) — 투구 직전부터 핀에 닿은 직후까지", 0.0, float(duration),
+                               (0.0, float(duration)), step=0.1, key="trk_range")
+        with st.expander("고급 설정 (공이 안 잡힐 때 조정)"):
+            var_thr = st.slider("움직임 감지 민감도 (작을수록 민감)", 4, 60, 20, key="trk_var")
+
+        valid_geo = abs(y_foul - y_pin) >= 20 and lane_x[0] < lane_x[1]
+        if not valid_geo:
+            st.warning("파울라인과 1번 핀 높이는 20% 이상 떨어져 있어야 하고, 레인 가로 범위의 시작값이 끝값보다 작아야 합니다.")
+        params = (int(y_foul), int(y_pin), tuple(lane_x), tuple(d_rng), int(var_thr), float(t_lo), float(t_hi))
+        if st.button("🎯 공 추적 실행", type="primary", key="trk_run", disabled=not valid_geo):
+            with st.spinner("공을 추적하는 중..."):
+                cands = spd_track(video_path, tuple(lane_x), int(y_foul), int(y_pin), tuple(d_rng), int(var_thr),
+                                  int(t_lo * fps), min(int(t_hi * fps), n - 1))
+            st.session_state["trk_res"] = {"path": video_path, "cands": cands, "params": params}
+
+        res = st.session_state.get("trk_res")
+        if res and res["path"] == video_path:
+            if res["params"] != params:
+                st.info("설정이 바뀌었습니다. 다시 **공 추적 실행**을 눌러 주세요.")
+            else:
+                chain = spd_chain(res["cands"], y_foul, y_pin)
+                span = abs(y_foul - y_pin)
+                progress = abs(chain[-1][2] - chain[0][2]) if chain else 0.0
+                if len(chain) < 6 or progress < 0.4 * span:
+                    st.warning(
+                        f"공의 궤적을 충분히 찾지 못했습니다 (후보 {len(res['cands'])}개). "
+                        "분석 구간을 투구 시점으로 좁히거나, 공 지름 범위/레인 가로 범위를 조정하거나, 민감도를 낮춰 보세요. "
+                        "계속 안 되면 '영역 변화 감지'나 '수동' 방식을 쓰세요.")
+                else:
+                    (ta, est_a), (tb, est_b) = spd_cross(chain, y_foul, y_pin, fps)
+                    mid_f = chain[len(chain) // 2][0]
+                    mid_img = spd_read_frame(video_path, int(mid_f))
+                    if mid_img is not None:
+                        st.image(spd_draw_lines(mid_img, y_foul, y_pin, lane_x, chain),
+                                 caption=f"추적된 공 궤적 (빨간 점 {len(chain)}개)")
+
+                    tt = [c[0] / fps for c in chain]
+                    yy = [c[2] for c in chain]
+                    fig_t = go.Figure(go.Scatter(x=tt, y=yy, mode="markers+lines", name="공 위치",
+                                                 line=dict(color="#d62728")))
+                    fig_t.add_hline(y=y_foul, line_dash="dot", line_color="#1e90ff", annotation_text="파울라인")
+                    fig_t.add_hline(y=y_pin, line_dash="dot", line_color="#ff8c00", annotation_text="1번 핀")
+                    fig_t.add_vline(x=ta, line_dash="dash", line_color="#1e90ff")
+                    fig_t.add_vline(x=tb, line_dash="dash", line_color="#ff8c00")
+                    fig_t.update_layout(title="시간에 따른 공의 화면 높이", xaxis_title="영상 시간 (초)",
+                                        yaxis=dict(title="화면 높이 (%)", autorange="reversed"),
+                                        height=320, margin=dict(l=20, r=10, t=50, b=20))
+                    stretch(st.plotly_chart, fig_t)
+
+                    st.success(f"파울라인 통과 {ta:.3f} 초 → 1번 핀 도달 {tb:.3f} 초")
+                    if est_a or est_b:
+                        st.caption("⚠️ 공이 기준선까지 찍히지 않아 일부 시각은 궤적을 연장해 추정한 값입니다. 결과가 이상하면 수동으로 확인하세요.")
+                    st.button("✋ 이 값을 수동 모드로 가져가 확인/미세 조정", on_click=spd_send_manual,
+                              args=(max(ta, 0.0), max(tb, 0.0), fps), key="trk_to_manual")
+                    elapsed = tb - ta
+        else:
+            st.info("기준선을 맞춘 뒤 **공 추적 실행**을 눌러 주세요.")
+
+    # ── 자동 (영역 변화 감지) ──
     elif mode == MODE_AUTO and video_ok:
         method_label = "자동"
         n = info["n"]
