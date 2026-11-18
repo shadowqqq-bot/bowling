@@ -1,4 +1,9 @@
+import os
 import re
+import tempfile
+from collections import deque
+
+import numpy as np
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -6,6 +11,11 @@ import plotly.graph_objects as go
 from datetime import datetime
 from github import Github, GithubException
 from io import StringIO
+
+try:  # 영상 분석용 (requirements.txt 에 opencv-python-headless 필요)
+    import cv2
+except Exception:
+    cv2 = None
 
 st.set_page_config(page_title="볼링 에버리지 트래커", page_icon="🎳", layout="wide")
 st.markdown("<h1 style='font-size: 24px;'>🎳 김형용 - 볼링 에버리지 기록 & 분석</h1>", unsafe_allow_html=True)
@@ -16,6 +26,9 @@ THEORY_FILE = "bowling_theory.csv"
 BALL_FILE = "bowling_balls.csv"
 DEFAULT_ALLEY = "덕우스핀볼링장"
 NO_BALL = "(선택 안 함)"
+SPEED_FILE = "bowling_speed.csv"
+SPEED_COLS = ['Date', 'Ball', 'Time_s', 'Distance_m', 'Speed_kmh', 'Method', 'Memo']
+LANE_LENGTH_M = 18.288  # 파울라인 ~ 1번 핀 중심 (60피트)
 
 BALL_COLS = ['제조사', '품명', '코어', '커버스톡', 'TYPE', '마감', 'RG', 'DIFF', 'ASY', '메모']
 BALL_NUM_COLS = ['RG', 'DIFF', 'ASY']
@@ -160,6 +173,15 @@ for c in BALL_COLS:
         ball_df[c] = ball_df[c].fillna('').astype(str)
 ball_names = list(dict.fromkeys(n for n in ball_df['품명'] if n.strip()))
 
+speed_df, speed_sha = load_csv(SPEED_FILE, SPEED_COLS)
+speed_df['Date'] = pd.to_datetime(speed_df['Date'], errors='coerce')
+for c in ['Time_s', 'Distance_m', 'Speed_kmh']:
+    speed_df[c] = pd.to_numeric(speed_df[c], errors='coerce')
+for c in ['Ball', 'Method', 'Memo']:
+    speed_df[c] = speed_df[c].fillna('').astype(str)
+speed_df = speed_df.dropna(subset=['Date']).sort_values('Date', kind='stable').reset_index(drop=True)
+speed_df = speed_df[SPEED_COLS]
+
 # ───────────────────────── 사이드바 ─────────────────────────
 with st.sidebar:
     if st.button("🔄 GitHub 새로고침"):
@@ -241,13 +263,14 @@ else:
     st.info("아직 등록된 볼링 점수 기록이 없습니다. 왼쪽 상단 `[>]` 메뉴를 열어 첫 점수를 입력해 보세요!")
 
 # ───────────────────────── 탭 ─────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📈 그래프",
     "📋 기록 조회 및 수정",
     "🏢 볼링장별",
     "📝 레슨 후기",
     "📚 볼링 이론/용어",
-    "🎳 볼링공 정보"
+    "🎳 볼링공 정보",
+    "🚀 구속 측정"
 ])
 
 # 탭 1: 그래프
@@ -522,4 +545,413 @@ with tab6:
         if save_csv_to_github(cleaned_balls, BALL_FILE, ball_sha, "볼링공 정보 수정"):
             flash("볼링공 정보 변경사항이 저장되었습니다!")
             st.rerun()
+# ───────────────────────── 구속 측정 헬퍼 ─────────────────────────
+MODE_MANUAL = "✋ 수동 (영상 보며 지정)"
+MODE_AUTO = "🤖 자동 (영상 분석)"
+MODE_DIRECT = "⌨️ 시간 직접 입력"
+VIDEO_TYPES = ["mp4", "mov", "avi", "m4v", "mkv"]
+
+
+def spd_store_video(uploaded):
+    """업로드된 영상을 임시 파일로 저장(같은 파일이면 재사용)하고 경로를 반환."""
+    key = f"{uploaded.name}_{uploaded.size}"
+    if st.session_state.get("spd_vid_key") != key:
+        old = st.session_state.get("spd_vid_path")
+        if old and os.path.exists(old):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        suffix = os.path.splitext(uploaded.name)[1] or ".mp4"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(uploaded.getbuffer())
+        tmp.close()
+        st.session_state.update(spd_vid_key=key, spd_vid_path=tmp.name,
+                                spd_frame=0, spd_t_start=0.0, spd_t_end=0.0)
+        st.session_state.pop("spd_series", None)
+    return st.session_state["spd_vid_path"]
+
+
+@st.cache_data(show_spinner=False)
+def spd_video_info(path):
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+    info = dict(
+        fps=float(cap.get(cv2.CAP_PROP_FPS) or 0.0),
+        n=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0),
+        w=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
+        h=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
+    )
+    cap.release()
+    return info
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def spd_read_frame(path, idx):
+    cap = cv2.VideoCapture(path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    h, w = frame.shape[:2]
+    if w > 960:
+        frame = cv2.resize(frame, (960, int(h * 960 / w)), interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def spd_draw_rois(frame_rgb, rois):
+    img = frame_rgb.copy()
+    h, w = img.shape[:2]
+    for name, (x1, x2), (y1, y2), color in rois:
+        p1 = (int(w * x1 / 100), int(h * y1 / 100))
+        p2 = (int(w * x2 / 100), int(h * y2 / 100))
+        cv2.rectangle(img, p1, p2, color, max(2, w // 300))
+        cv2.putText(img, name, (p1[0] + 4, p1[1] + int(h * 0.05)),
+                    cv2.FONT_HERSHEY_SIMPLEX, max(0.6, w / 1200), color, 2)
+    return img
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def spd_motion(path, roi_a, roi_b, pix_thr, f_lo, f_hi, step):
+    """두 감시 영역(A: 파울라인, B: 핀)의 프레임 간 변화량(%)을 구한다."""
+    cap = cv2.VideoCapture(path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(f_lo))
+    idxs, ma, mb = [], [], []
+    hist_a, hist_b = deque(maxlen=step + 1), deque(maxlen=step + 1)
+
+    def crop(gray, roi):
+        (x1, x2), (y1, y2) = roi
+        h, w = gray.shape
+        ya, yb = int(h * y1 / 100), int(h * y2 / 100)
+        xa, xb = int(w * x1 / 100), int(w * x2 / 100)
+        return gray[ya:max(yb, ya + 1), xa:max(xb, xa + 1)]
+
+    i = int(f_lo)
+    while i <= int(f_hi):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        w0 = frame.shape[1]
+        if w0 > 480:
+            frame = cv2.resize(frame, None, fx=480.0 / w0, fy=480.0 / w0, interpolation=cv2.INTER_AREA)
+        gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+        hist_a.append(crop(gray, roi_a))
+        hist_b.append(crop(gray, roi_b))
+        if len(hist_a) == step + 1:
+            ma.append(float((cv2.absdiff(hist_a[-1], hist_a[0]) > pix_thr).mean() * 100))
+            mb.append(float((cv2.absdiff(hist_b[-1], hist_b[0]) > pix_thr).mean() * 100))
+        else:
+            ma.append(0.0)
+            mb.append(0.0)
+        idxs.append(i)
+        i += 1
+    cap.release()
+    return np.array(idxs), np.array(ma), np.array(mb)
+
+
+def spd_detect(idxs, ma, mb, thr_a, thr_b):
+    """A영역이 처음 기준을 넘는 프레임 = 파울라인 통과, 그 이후 B영역이 처음 기준을 넘는 프레임 = 핀 타격."""
+    if len(idxs) == 0:
+        return None, None
+    hit_a = np.where(ma >= thr_a)[0]
+    if hit_a.size == 0:
+        return None, None
+    a = int(hit_a[0])
+    hit_b = np.where((mb >= thr_b) & (np.arange(len(mb)) > a))[0]
+    b = int(hit_b[0]) if hit_b.size else None
+    return int(idxs[a]), (int(idxs[b]) if b is not None else None)
+
+
+def spd_step(delta):
+    n = st.session_state.get("spd_nframes", 1)
+    st.session_state["spd_frame"] = int(min(max(st.session_state.get("spd_frame", 0) + delta, 0), n - 1))
+
+
+def spd_mark(key):
+    fps = st.session_state.get("spd_fps", 30.0) or 30.0
+    st.session_state[key] = round(st.session_state.get("spd_frame", 0) / fps, 3)
+
+
+def spd_goto(key):
+    fps = st.session_state.get("spd_fps", 30.0) or 30.0
+    n = st.session_state.get("spd_nframes", 1)
+    st.session_state["spd_frame"] = int(min(max(round(st.session_state.get(key, 0.0) * fps), 0), n - 1))
+
+
+def spd_send_manual(t_start, t_end, fps):
+    st.session_state["spd_t_start"] = round(float(t_start), 3)
+    st.session_state["spd_t_end"] = round(float(t_end), 3)
+    st.session_state["spd_frame"] = int(round(t_start * fps))
+    st.session_state["spd_mode"] = MODE_MANUAL
+
+
+# 탭 7: 구속 측정
+with tab7:
+    st.subheader("🚀 볼링공 구속 측정")
+    st.caption("구속(km/h) = 레인 길이(m) ÷ 파울라인~핀 도달 시간(초) × 3.6 · 릴리스 속도가 아니라 파울라인~핀 구간의 **평균 속도**입니다.")
+
+    # 다른 측정 방식으로 옮겨 다녀도 값이 유지되도록 매 실행마다 다시 저장
+    for _k, _d in (("spd_frame", 0), ("spd_t_start", 0.0), ("spd_t_end", 0.0)):
+        st.session_state[_k] = st.session_state.get(_k, _d)
+
+    cs1, cs2 = st.columns(2)
+    with cs1:
+        lane_len = st.number_input(
+            "레인 길이 (파울라인 ~ 1번 핀, m)", min_value=1.0, max_value=30.0,
+            value=LANE_LENGTH_M, step=0.001, format="%.3f", key="spd_lane",
+            help="규정상 파울라인에서 1번 핀 중심까지 60피트 = 18.288 m 입니다.")
+    with cs2:
+        slow_factor = st.number_input(
+            "슬로모션 배율 (일반 영상은 1)", min_value=1.0, max_value=32.0,
+            value=1.0, step=1.0, key="spd_slow",
+            help="240fps 슬로모션을 30fps로 저장한 영상처럼 실제보다 N배 느리게 재생되는 영상이면 N을 입력하세요. 실제 시간 = 영상 시간 ÷ 배율")
+
+    mode = st.radio("측정 방식", [MODE_MANUAL, MODE_AUTO, MODE_DIRECT], horizontal=True, key="spd_mode")
+
+    video_ok, video_path, up, info = False, None, None, None
+    fps = 0.0
+    if mode != MODE_DIRECT:
+        if cv2 is None:
+            st.error("영상 분석 라이브러리(OpenCV)가 없습니다. requirements.txt 에 `opencv-python-headless` 를 추가해 주세요. "
+                     "(지금은 '시간 직접 입력' 방식만 쓸 수 있어요.)")
+        else:
+            up = st.file_uploader("🎬 투구 영상 업로드", type=VIDEO_TYPES, key="spd_upload",
+                                  help="삼각대로 고정해 촬영한 영상이 가장 좋습니다. 투구 전후 10~20초로 짧게 자르면 분석이 빨라요.")
+            if up is not None:
+                video_path = spd_store_video(up)
+                info = spd_video_info(video_path)
+                if not info or info["n"] < 2 or info["fps"] <= 0:
+                    st.error("영상 정보를 읽지 못했습니다. mp4(H.264) 형식으로 변환해서 다시 올려 주세요.")
+                else:
+                    video_ok = True
+                    fps = info["fps"]
+                    st.session_state["spd_fps"] = fps
+                    st.session_state["spd_nframes"] = info["n"]
+                    st.caption(f"{info['w']}×{info['h']} · {fps:.2f} fps · {info['n']} 프레임 · {info['n'] / fps:.1f} 초 "
+                               f"(프레임 1칸 = {1000 / fps:.1f} ms)")
+            else:
+                st.info("영상을 올리면 시작할 수 있어요. 영상 없이 스톱워치로 잰 시간만 있다면 '시간 직접 입력'을 선택하세요.")
+
+    elapsed = None          # 영상(또는 입력) 기준 걸린 시간(초)
+    method_label = ""
+
+    # ── 수동 ──
+    if mode == MODE_MANUAL and video_ok:
+        method_label = "수동"
+        n = info["n"]
+        with st.expander("▶ 원본 영상 재생 (대략적인 위치 확인용)", expanded=True):
+            st.video(up)
+        st.markdown("**① 프레임을 넘겨 보며 정확한 순간을 찾으세요**")
+        nav = st.columns(4)
+        nav[0].button("⏪ -10", on_click=spd_step, args=(-10,), key="spd_m10")
+        nav[1].button("◀ -1", on_click=spd_step, args=(-1,), key="spd_m1")
+        nav[2].button("+1 ▶", on_click=spd_step, args=(1,), key="spd_p1")
+        nav[3].button("+10 ⏩", on_click=spd_step, args=(10,), key="spd_p10")
+        st.slider("프레임 번호", 0, n - 1, key="spd_frame")
+        fi = st.session_state["spd_frame"]
+        img = spd_read_frame(video_path, fi)
+        if img is not None:
+            st.image(img, caption=f"프레임 {fi} / {n - 1}  ·  {fi / fps:.3f} 초")
+        mk1, mk2 = st.columns(2)
+        mk1.button("📍 이 프레임 = 파울라인 통과", on_click=spd_mark, args=("spd_t_start",),
+                   type="primary", key="spd_mark_s")
+        mk2.button("💥 이 프레임 = 핀 타격", on_click=spd_mark, args=("spd_t_end",),
+                   type="primary", key="spd_mark_e")
+
+        st.markdown("**② 지정된 시각 (숫자를 직접 고쳐도 됩니다)**")
+        tc1, tc2 = st.columns(2)
+        t_start = tc1.number_input("파울라인 통과 시각 (초)", min_value=0.0, step=0.001, format="%.3f", key="spd_t_start")
+        t_end = tc2.number_input("핀 타격 시각 (초)", min_value=0.0, step=0.001, format="%.3f", key="spd_t_end")
+        gc1, gc2 = st.columns(2)
+        gc1.button("↩ 파울라인 시각 프레임으로 이동", on_click=spd_goto, args=("spd_t_start",), key="spd_go_s")
+        gc2.button("↩ 핀 타격 시각 프레임으로 이동", on_click=spd_goto, args=("spd_t_end",), key="spd_go_e")
+
+        if t_end > 0:
+            th1, th2 = st.columns(2)
+            im_s = spd_read_frame(video_path, min(int(round(t_start * fps)), n - 1))
+            im_e = spd_read_frame(video_path, min(int(round(t_end * fps)), n - 1))
+            if im_s is not None:
+                th1.image(im_s, caption=f"파울라인 통과 ({t_start:.3f} 초)")
+            if im_e is not None:
+                th2.image(im_e, caption=f"핀 타격 ({t_end:.3f} 초)")
+        elapsed = t_end - t_start
+
+    # ── 자동 ──
+    elif mode == MODE_AUTO and video_ok:
+        method_label = "자동"
+        n = info["n"]
+        duration = n / fps
+        st.markdown("**① 감시 영역 지정** — 카메라는 고정되어 있어야 합니다. 파란 영역(A)은 파울라인 바로 앞 레인, 주황 영역(B)은 핀 데크에 맞추세요.")
+        ra, rb = st.columns(2)
+        with ra:
+            st.markdown("🟦 **A: 파울라인 영역**")
+            fx = st.slider("A 가로 범위 (%)", 0, 100, (25, 75), key="spd_fx")
+            fy = st.slider("A 세로 범위 (%)", 0, 100, (75, 95), key="spd_fy")
+        with rb:
+            st.markdown("🟧 **B: 핀 영역**")
+            pnx = st.slider("B 가로 범위 (%)", 0, 100, (40, 60), key="spd_px")
+            pny = st.slider("B 세로 범위 (%)", 0, 100, (5, 25), key="spd_py")
+        ref_idx = st.slider("미리보기 프레임", 0, n - 1, 0, key="spd_ref")
+        ref_img = spd_read_frame(video_path, ref_idx)
+        if ref_img is not None:
+            st.image(spd_draw_rois(ref_img, [("A", fx, fy, (30, 144, 255)), ("B", pnx, pny, (255, 140, 0))]),
+                     caption="감시 영역 미리보기")
+
+        st.markdown("**② 분석 설정**")
+        t_lo, t_hi = st.slider("분석 구간 (초) — 투구 직전부터 핀이 쓰러진 직후까지만", 0.0, float(duration),
+                               (0.0, float(duration)), step=0.1, key="spd_range")
+        with st.expander("고급 설정 (감지가 잘 안 될 때 조정)"):
+            pix_thr = st.slider("픽셀 변화 민감도 (작을수록 민감)", 5, 80, 25, key="spd_pix")
+
+        region_ok = fx[0] < fx[1] and fy[0] < fy[1] and pnx[0] < pnx[1] and pny[0] < pny[1]
+        if not region_ok:
+            st.warning("감시 영역의 범위가 올바르지 않습니다. 시작값이 끝값보다 작아야 합니다.")
+        if st.button("🔍 영상 분석 실행", type="primary", key="spd_run", disabled=not region_ok):
+            step = max(1, int(round(fps / 30)))
+            with st.spinner("영상을 분석하는 중..."):
+                series = spd_motion(video_path, (fx, fy), (pnx, pny), int(pix_thr),
+                                    int(t_lo * fps), min(int(t_hi * fps), n - 1), step)
+            st.session_state["spd_series"] = {"path": video_path, "data": series}
+
+        ser = st.session_state.get("spd_series")
+        if ser and ser["path"] == video_path:
+            idxs, ma, mb = ser["data"]
+            if len(idxs) == 0:
+                st.error("분석할 프레임을 읽지 못했습니다. 분석 구간을 확인해 주세요.")
+            else:
+                st.markdown("**③ 감지 기준** — 그래프를 보고 기준선(점선)을 조정하세요.")
+                dc1, dc2 = st.columns(2)
+                thr_a = dc1.slider("A(파울라인) 감지 기준 (% 변화)", 0.1, 50.0, 1.0, 0.1, key="spd_thr_a")
+                thr_b = dc2.slider("B(핀) 감지 기준 (% 변화)", 0.5, 80.0, 8.0, 0.5, key="spd_thr_b")
+                fa, fb = spd_detect(idxs, ma, mb, thr_a, thr_b)
+
+                tt = idxs / fps
+                fig_m = go.Figure()
+                fig_m.add_trace(go.Scatter(x=tt, y=ma, mode="lines", name="A 파울라인 영역", line=dict(color="#1e90ff")))
+                fig_m.add_trace(go.Scatter(x=tt, y=mb, mode="lines", name="B 핀 영역", line=dict(color="#ff8c00")))
+                fig_m.add_hline(y=thr_a, line_dash="dot", line_color="#1e90ff")
+                fig_m.add_hline(y=thr_b, line_dash="dot", line_color="#ff8c00")
+                if fa is not None:
+                    fig_m.add_vline(x=fa / fps, line_dash="dash", line_color="#1e90ff", annotation_text="파울라인")
+                if fb is not None:
+                    fig_m.add_vline(x=fb / fps, line_dash="dash", line_color="#ff8c00", annotation_text="핀 타격")
+                fig_m.update_layout(title="영역별 움직임 (프레임 간 변화 %)", xaxis_title="영상 시간 (초)",
+                                    yaxis_title="변화 %", height=320, margin=dict(l=20, r=10, t=50, b=20))
+                stretch(st.plotly_chart, fig_m)
+
+                if fa is None:
+                    st.warning("파울라인 통과를 감지하지 못했습니다. A 기준을 낮추거나 A 영역을 공이 지나는 레인 쪽으로 좁혀 보세요.")
+                elif fb is None:
+                    st.warning("핀 타격을 감지하지 못했습니다. B 기준을 낮추거나 B 영역을 핀 전체가 들어오게 조정해 보세요.")
+                else:
+                    ta, tb = fa / fps, fb / fps
+                    st.success(f"파울라인 통과 {ta:.3f} 초 (프레임 {fa}) → 핀 타격 {tb:.3f} 초 (프레임 {fb})")
+                    sa, sb = st.columns(2)
+                    ia, ib = spd_read_frame(video_path, fa), spd_read_frame(video_path, fb)
+                    if ia is not None:
+                        sa.image(ia, caption="감지된 파울라인 통과 프레임")
+                    if ib is not None:
+                        sb.image(ib, caption="감지된 핀 타격 프레임")
+                    st.button("✋ 이 값을 수동 모드로 가져가 미세 조정", on_click=spd_send_manual,
+                              args=(ta, tb, fps), key="spd_to_manual")
+                    elapsed = tb - ta
+        else:
+            st.info("감시 영역을 맞춘 뒤 **영상 분석 실행**을 눌러 주세요.")
+
+    # ── 직접 입력 ──
+    elif mode == MODE_DIRECT:
+        method_label = "직접입력"
+        elapsed = st.number_input("파울라인 → 핀까지 걸린 시간 (초)", min_value=0.1, max_value=20.0,
+                                  value=2.5, step=0.01, format="%.3f", key="spd_direct")
+
+    # ── 결과 ──
+    st.divider()
+    if elapsed is not None and elapsed <= 0:
+        st.warning("핀 타격 시각이 파울라인 통과 시각보다 늦어야 합니다.")
+    elif elapsed is not None:
+        real_t = elapsed / slow_factor
+        ms = lane_len / real_t
+        kmh = ms * 3.6
+        mph = kmh / 1.609344
+
+        rc = st.columns(4)
+        rc[0].metric("🚀 구속", f"{kmh:.1f} km/h")
+        rc[1].metric("mph", f"{mph:.1f}")
+        rc[2].metric("실제 걸린 시간", f"{real_t:.3f} 초")
+        rc[3].metric("초속", f"{ms:.2f} m/s")
+
+        if video_ok and mode != MODE_DIRECT:
+            err = 1.0 / fps / slow_factor
+            if real_t - err > 0:
+                st.caption(f"±1프레임({err * 1000:.0f} ms) 오차 범위: "
+                           f"{lane_len / (real_t + err) * 3.6:.1f} ~ {lane_len / (real_t - err) * 3.6:.1f} km/h")
+        if kmh < 10 or kmh > 45:
+            st.warning("일반적인 구속(대략 20~35 km/h)과 차이가 큽니다. 시각, 슬로모션 배율, 레인 길이를 다시 확인해 보세요.")
+
+        with st.form("speed_form"):
+            sf1, sf2, sf3 = st.columns([1, 1, 2])
+            s_date = sf1.date_input("측정 날짜", datetime.today())
+            s_ball = sf2.selectbox("사용한 볼", [NO_BALL] + ball_names)
+            s_memo = sf3.text_input("메모", placeholder="예: 3번 레인, 훅 많이 줌")
+            if st.form_submit_button("💾 구속 기록 저장"):
+                row = {
+                    'Date': pd.to_datetime(s_date),
+                    'Ball': "" if s_ball == NO_BALL else s_ball,
+                    'Time_s': round(real_t, 3),
+                    'Distance_m': round(lane_len, 3),
+                    'Speed_kmh': round(kmh, 2),
+                    'Method': method_label,
+                    'Memo': s_memo.strip(),
+                }
+                new_df = add_row(speed_df, row).sort_values('Date', kind='stable').reset_index(drop=True)
+                if save_csv_to_github(new_df, SPEED_FILE, speed_sha, "구속 기록 추가"):
+                    flash(f"{kmh:.1f} km/h 기록이 저장되었습니다!")
+                    st.rerun()
+
+    # ── 기록 ──
+    st.divider()
+    st.subheader("📊 구속 기록")
+    if speed_df.empty:
+        st.caption("저장된 구속 기록이 없습니다. 위에서 측정한 뒤 '구속 기록 저장'을 눌러 보세요.")
+    else:
+        sp = speed_df.copy()
+        sc = st.columns(3)
+        sc[0].metric("측정 횟수", f"{len(sp)} 회")
+        sc[1].metric("평균 구속", f"{sp['Speed_kmh'].mean():.1f} km/h")
+        sc[2].metric("최고 구속", f"{sp['Speed_kmh'].max():.1f} km/h")
+
+        fig_sp = px.line(sp, x='Date', y='Speed_kmh', markers=True, hover_data=['Ball', 'Method', 'Memo'],
+                         title="구속 추이", labels={'Date': '날짜', 'Speed_kmh': '구속 (km/h)'})
+        stretch(st.plotly_chart, fig_sp)
+
+        by_ball = sp.assign(Ball=sp['Ball'].replace('', '(미지정)')).groupby('Ball').agg(
+            측정횟수=('Speed_kmh', 'count'), 평균구속=('Speed_kmh', 'mean'), 최고구속=('Speed_kmh', 'max')
+        ).reset_index()
+        by_ball['평균구속'] = by_ball['평균구속'].round(1)
+        by_ball['최고구속'] = by_ball['최고구속'].round(1)
+        stretch(st.dataframe, by_ball.rename(columns={'Ball': '볼'}), hide_index=True)
+
+        st.caption("💡 표에서 메모를 고치거나 행을 삭제한 뒤 **'구속 기록 변경사항 저장'**을 누르세요.")
+        edit_sp = sp.sort_values('Date', ascending=False, kind='stable').reset_index(drop=True)
+        edit_sp['Date'] = edit_sp['Date'].dt.date
+        edited_sp = stretch(
+            st.data_editor, edit_sp, num_rows="dynamic", key="speed_editor",
+            column_config={
+                "Date": st.column_config.DateColumn("날짜", format="YYYY-MM-DD", required=True),
+                "Ball": st.column_config.TextColumn("볼"),
+                "Time_s": st.column_config.NumberColumn("시간(초)", format="%.3f"),
+                "Distance_m": st.column_config.NumberColumn("거리(m)", format="%.3f"),
+                "Speed_kmh": st.column_config.NumberColumn("구속(km/h)", format="%.2f", required=True),
+                "Method": st.column_config.TextColumn("방식"),
+                "Memo": st.column_config.TextColumn("메모"),
+            })
+        if st.button("💾 구속 기록 변경사항 저장", key="save_speed"):
+            cleaned_sp = edited_sp.dropna(subset=['Date', 'Speed_kmh']).copy()
+            cleaned_sp['Date'] = pd.to_datetime(cleaned_sp['Date'])
+            cleaned_sp = cleaned_sp.sort_values('Date', kind='stable').reset_index(drop=True)
+            if save_csv_to_github(cleaned_sp, SPEED_FILE, speed_sha, "구속 기록 수정"):
+                flash("구속 기록 변경사항이 저장되었습니다!")
+                st.rerun()
 # --- 코드 끝 ---
