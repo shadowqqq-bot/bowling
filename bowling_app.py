@@ -551,6 +551,8 @@ MODE_TRACK = "🎯 자동 (공 추적)"
 MODE_AUTO = "🤖 자동 (영역 변화 감지)"
 MODE_DIRECT = "⌨️ 시간 직접 입력"
 VIDEO_TYPES = ["mp4", "mov", "avi", "m4v", "mkv"]
+END_MOTION = "💥 핀이 움직이기 시작하는 순간 (추천)"
+END_LINE = "📏 1번 핀 높이 선 통과"
 
 
 def spd_store_video(uploaded):
@@ -666,14 +668,21 @@ def spd_detect(idxs, ma, mb, thr_a, thr_b):
     return int(idxs[a]), (int(idxs[b]) if b is not None else None)
 
 
-def spd_draw_lines(frame_rgb, y_foul, y_pin, lane_x, chain=None):
-    """기준선(파울라인/1번 핀), 레인 범위, (선택) 추적된 공 궤적을 그린다."""
+def spd_draw_lines(frame_rgb, y_foul, y_pin, lane_x, chain=None, marker=None, pin_box=None):
+    """기준선(파울라인/1번 핀 또는 핀 영역 상자), 레인 범위, (선택) 추적된 공 궤적과 색 따오기 위치를 그린다."""
     img = frame_rgb.copy()
     h, w = img.shape[:2]
     th = max(2, w // 300)
-    for y, color in ((y_foul, (30, 144, 255)), (y_pin, (255, 140, 0))):
-        yy = int(h * y / 100)
-        cv2.line(img, (0, yy), (w, yy), color, th)
+    blue, orange = (30, 144, 255), (255, 140, 0)
+    yy = int(h * y_foul / 100)
+    cv2.line(img, (0, yy), (w, yy), blue, th)
+    if pin_box is None:
+        yy = int(h * y_pin / 100)
+        cv2.line(img, (0, yy), (w, yy), orange, th)
+    else:
+        (bx1, bx2), (by1, by2) = pin_box
+        cv2.rectangle(img, (int(w * bx1 / 100), int(h * by1 / 100)),
+                      (int(w * bx2 / 100), int(h * by2 / 100)), orange, th)
     for x in lane_x:
         xx = int(w * x / 100)
         cv2.line(img, (xx, 0), (xx, h), (60, 200, 60), th)
@@ -683,18 +692,75 @@ def spd_draw_lines(frame_rgb, y_foul, y_pin, lane_x, chain=None):
             cv2.line(img, p, q, (255, 0, 0), max(1, th // 2))
         for p in pts:
             cv2.circle(img, p, max(3, w // 160), (255, 0, 0), -1)
+    if marker:
+        mx, my = int(w * marker[0] / 100), int(h * marker[1] / 100)
+        r = max(8, w // 50)
+        cv2.circle(img, (mx, my), r, (255, 255, 0), th)
+        cv2.line(img, (mx - r, my), (mx + r, my), (255, 255, 0), 1)
+        cv2.line(img, (mx, my - r), (mx, my + r), (255, 255, 0), 1)
     return img
 
 
+def spd_crop(img, x_rng, y_center, half=5.0, out_w=900):
+    """레인 가로 범위 × (y_center ± half)% 영역을 잘라 확대한다 (기준선을 정밀하게 맞출 때 사용)."""
+    h, w = img.shape[:2]
+    x0, x1 = int(w * max(x_rng[0] - 3, 0) / 100), int(w * min(x_rng[1] + 3, 100) / 100)
+    y0, y1 = int(h * max(y_center - half, 0) / 100), int(h * min(y_center + half, 100) / 100)
+    crop = img[y0:max(y1, y0 + 2), x0:max(x1, x0 + 2)]
+    s = out_w / crop.shape[1]
+    return cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+
+
+def spd_color_params(hex_color, tol):
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    h, s, v = cv2.cvtColor(np.uint8([[[r, g, b]]]), cv2.COLOR_RGB2HSV)[0, 0]
+    return (int(h), int(s), int(v), int(tol))
+
+
+def spd_color_mask(hsv, color):
+    """HSV 이미지에서 지정한 색(색조 ± 허용 오차)에 해당하는 픽셀을 255로 표시."""
+    h, s, v, tol = color
+    dh = np.abs(hsv[..., 0].astype(np.int16) - h)
+    dh = np.minimum(dh, 180 - dh)
+    s_min, v_min = max(40, int(s * 0.5)), max(30, int(v * 0.4))
+    return ((dh <= tol) & (hsv[..., 1] >= s_min) & (hsv[..., 2] >= v_min)).astype(np.uint8) * 255
+
+
+def spd_color_preview(frame_rgb, color):
+    img = frame_rgb.copy()
+    mask = spd_color_mask(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV), color)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    img[mask > 0] = (0, 255, 0)
+    return img
+
+
+def spd_pick_color():
+    """미리보기 프레임의 지정 위치(주변 중앙값)에서 공 색을 따온다."""
+    path = st.session_state.get("spd_vid_path")
+    img = spd_read_frame(path, st.session_state.get("trk_ref", 0)) if path else None
+    if img is None:
+        return
+    h, w = img.shape[:2]
+    cx = int(w * st.session_state.get("trk_sx", 50.0) / 100)
+    cy = int(h * st.session_state.get("trk_sy", 50.0) / 100)
+    r = max(2, w // 250)
+    patch = img[max(cy - r, 0):cy + r + 1, max(cx - r, 0):cx + r + 1].reshape(-1, 3)
+    rgb = np.median(patch, axis=0).astype(int)
+    st.session_state["trk_color"] = "#%02x%02x%02x" % tuple(int(c) for c in rgb)
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
-def spd_track(path, lane_x, y_foul, y_pin, d_rng, var_thr, f_lo, f_hi):
-    """배경 제거로 움직이는 물체를 찾고, 공 크기·모양에 맞는 후보 (프레임, x%, y%)를 모은다."""
+def spd_track(path, lane_x, y_foul, y_pin, d_rng, var_thr, f_lo, f_hi, color=None):
+    """공 후보 (프레임, x%, y%)를 모은다. color가 없으면 배경 제거(움직임)로, 있으면 공 색상으로 찾는다."""
     cap = cv2.VideoCapture(path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(f_lo))
-    sub = cv2.createBackgroundSubtractorMOG2(history=150, varThreshold=float(var_thr), detectShadows=False)
+    sub = (cv2.createBackgroundSubtractorMOG2(history=150, varThreshold=float(var_thr), detectShadows=False)
+           if color is None else None)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     y_lo, y_hi = sorted((y_foul, y_pin))
-    margin = 6.0  # 기준선 바깥도 조금 포함해 보간 정확도를 높임
+    m_foul = min(6.0, 0.35 * abs(y_foul - y_pin))  # 파울라인 바깥쪽은 보간 정확도를 위해 조금 더 포함
+    m_pin = 0.5  # 핀 쪽은 핀 위쪽의 빨간 표시등 같은 잡음을 막기 위해 거의 포함하지 않음
+    m_lo, m_hi = (m_pin, m_foul) if y_pin < y_foul else (m_foul, m_pin)
     cands = []
     i = int(f_lo)
     while i <= int(f_hi):
@@ -705,10 +771,14 @@ def spd_track(path, lane_x, y_foul, y_pin, d_rng, var_thr, f_lo, f_hi):
         if w0 > 480:
             frame = cv2.resize(frame, None, fx=480.0 / w0, fy=480.0 / w0, interpolation=cv2.INTER_AREA)
         h, w = frame.shape[:2]
-        gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-        mask = sub.apply(gray)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.dilate(mask, kernel, iterations=1)
+        if color is None:
+            gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+            mask = sub.apply(gray)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+        else:
+            hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (3, 3), 0), cv2.COLOR_BGR2HSV)
+            mask = cv2.morphologyEx(spd_color_mask(hsv, color), cv2.MORPH_CLOSE, kernel)
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         a_min = np.pi / 4 * (d_rng[0] / 100 * w) ** 2
         a_max = np.pi / 4 * (d_rng[1] / 100 * w) ** 2
@@ -728,7 +798,7 @@ def spd_track(path, lane_x, y_foul, y_pin, d_rng, var_thr, f_lo, f_hi):
             if m["m00"] == 0:
                 continue
             cx, cy = m["m10"] / m["m00"] / w * 100, m["m01"] / m["m00"] / h * 100
-            if not (lane_x[0] <= cx <= lane_x[1] and y_lo - margin <= cy <= y_hi + margin):
+            if not (lane_x[0] <= cx <= lane_x[1] and y_lo - m_lo <= cy <= y_hi + m_hi):
                 continue
             found.append((circ, i, cx, cy))
         found.sort(reverse=True)
@@ -739,7 +809,8 @@ def spd_track(path, lane_x, y_foul, y_pin, d_rng, var_thr, f_lo, f_hi):
 
 
 def spd_chain(cands, y_foul, y_pin, gap_max=4):
-    """후보들 중 핀 방향으로 꾸준히 전진하는 가장 긴 궤적(공)을 찾는다. 정지한 잡음은 전진량이 없어 탈락."""
+    """후보들 중 핀 방향으로 꾸준히 전진하는 가장 긴 궤적(공)을 찾는다.
+    공이 튀면서 생기는 작은 되돌림(0.6%까지)은 허용하고, 제자리의 잡음은 순 전진량이 없어 탈락한다."""
     if len(cands) < 4:
         return []
     direction = 1.0 if y_pin > y_foul else -1.0
@@ -757,7 +828,7 @@ def spd_chain(cands, y_foul, y_pin, gap_max=4):
             if gap < 1:
                 continue
             dy = (yj - yi) * direction
-            if dy < 0.02 or dy > 8.0 * gap or abs(xj - xi) > 6.0 * gap:
+            if dy < -0.6 or dy > 8.0 * gap or abs(xj - xi) > 6.0 * gap:
                 continue
             s = score[i] + dy + 0.001
             if s > score[j]:
@@ -772,20 +843,33 @@ def spd_chain(cands, y_foul, y_pin, gap_max=4):
 
 
 def spd_cross(chain, y_foul, y_pin, fps):
-    """궤적을 곡선으로 맞춰 기준선을 지나는 시각을 프레임 사이까지 보간. 범위 밖이면 끝부분 직선으로 추정."""
+    """궤적이 두 기준선을 지나는 시각을 프레임 사이까지 보간한다.
+    기준선을 지나는 구간 주변 몇 점만 직선으로 맞추고, 궤적이 기준선까지 가지 않았으면 끝부분을 연장(추정)한다."""
     arr = np.array(chain, dtype=float)
     t = arr[:, 0] / fps
     y = arr[:, 2]
-    coef = np.polyfit(y, t, 2 if len(arr) >= 8 else 1)
     out = []
     for yl in (y_foul, y_pin):
-        if y.min() <= yl <= y.max():
-            out.append((float(np.polyval(coef, yl)), False))
+        k = next((i for i in range(len(y) - 1) if (y[i] - yl) * (y[i + 1] - yl) <= 0 and y[i] != y[i + 1]), None)
+        if k is not None:
+            lo, hi = max(0, k - 2), min(len(y), k + 4)
+            c = np.polyfit(y[lo:hi], t[lo:hi], 1)
+            out.append((float(np.polyval(c, yl)), False))
         else:
             near = np.argsort(np.abs(y - yl))[:8]
-            c1 = np.polyfit(y[near], t[near], 1)
-            out.append((float(np.polyval(c1, yl)), True))
+            c = np.polyfit(y[near], t[near], 1)
+            out.append((float(np.polyval(c, yl)), True))
     return out
+
+
+def spd_pin_impact(idxs, mb, thr, after_frame):
+    """after_frame 이후 핀 영역의 변화가 처음 thr(%) 이상이 되는 프레임. 다음 프레임도 thr/2 이상이면 확정."""
+    for k in range(len(idxs)):
+        if idxs[k] <= after_frame:
+            continue
+        if mb[k] >= thr and (k + 1 >= len(mb) or mb[k + 1] >= thr * 0.5):
+            return int(idxs[k])
+    return None
 
 
 def spd_step(delta):
@@ -907,36 +991,84 @@ with tab7:
         method_label = "자동(추적)"
         n = info["n"]
         duration = n / fps
-        st.markdown("**① 기준선 지정** — 🟦 파란 선: 파울라인 · 🟧 주황 선: 1번 핀 위치 · 🟩 초록 세로선: 공이 지나가는 레인 범위. "
-                    "카메라는 고정되어 있어야 하고, 두 선은 레인과 직각(수평)이 되도록 맞춰 주세요.")
+        st.markdown("**① 기준선과 영역 지정** — 🟦 파란 선: 파울라인(공이 손을 떠나 레인에 닿는 높이) · 🟩 초록 세로선: 공이 지나가는 레인 범위 · "
+                    "🟧 주황 선/상자: 핀 쪽 기준. 카메라는 고정되어 있어야 하고, 비스듬히 찍어 레인이 납작하게 보여도 괜찮아요.")
         tl1, tl2 = st.columns(2)
         with tl1:
-            y_foul = st.slider("파울라인 높이 (%, 화면 맨 위 = 0)", 0, 100, 88, key="trk_yf")
-            y_pin = st.slider("1번 핀 높이 (%)", 0, 100, 18, key="trk_yp")
+            y_foul = st.slider("파울라인 높이 (%, 화면 맨 위 = 0)", 0.0, 100.0, 88.0, 0.1, key="trk_yf")
+            end_mode = st.radio("핀 도달 판정 방식", [END_MOTION, END_LINE], key="trk_end",
+                                help="레인이 화면에서 납작하게 보이면 핀 근처에서 공이 거의 안 움직여 높이 선으로는 시각이 크게 흔들립니다. "
+                                     "'핀이 움직이기 시작하는 순간'이 훨씬 정확해요.")
         with tl2:
-            lane_x = st.slider("레인 가로 범위 (%)", 0, 100, (25, 75), key="trk_x")
-            d_rng = st.slider("공 지름 범위 (화면 가로 대비 %)", 0.5, 12.0, (1.0, 6.0), 0.1, key="trk_d",
+            lane_x = st.slider("레인 가로 범위 (%)", 0.0, 100.0, (25.0, 75.0), 0.5, key="trk_x")
+            d_rng = st.slider("공 지름 범위 (화면 가로 대비 %)", 0.3, 12.0, (0.8, 6.0), 0.1, key="trk_d",
                               help="가까울 때 가장 크고 핀 쪽으로 갈수록 작아지니, 두 경우를 모두 포함하도록 넓게 잡으세요.")
-        trk_ref = st.slider("미리보기 프레임", 0, n - 1, 0, key="trk_ref")
+        if end_mode == END_LINE:
+            y_pin = st.slider("1번 핀 높이 (%)", 0.0, 100.0, 18.0, 0.1, key="trk_yp")
+            pin_x = pin_y = pin_thr = None
+        else:
+            pc1, pc2, pc3 = st.columns(3)
+            pin_x = pc1.slider("핀 영역 가로 (%)", 0.0, 100.0, (40.0, 60.0), 0.5, key="trk_px")
+            pin_y = pc2.slider("핀 영역 세로 (%)", 0.0, 100.0, (8.0, 20.0), 0.1, key="trk_py",
+                               help="서 있는 핀들이 들어가는 상자입니다. 공이 핀에 닿기 직전의 높이가 상자 아래쪽 끝 근처가 되게 맞추세요.")
+            pin_thr = pc3.slider("핀 움직임 감지 기준 (% 변화)", 0.05, 20.0, 0.2, 0.05, key="trk_pthr",
+                                 help="작을수록 민감합니다. 아래 그래프에서 핀이 맞기 전 평평한 구간보다 높게 잡으세요.")
+            y_pin = pin_y[1]
+        trk_ref = st.slider("미리보기 프레임 (공이 보이는 장면으로)", 0, n - 1, 0, key="trk_ref")
         ref_img = spd_read_frame(video_path, trk_ref)
+
+        use_color = st.checkbox("🎨 공 색상으로 추적 — 카메라를 손으로 들었거나 배경이 복잡할 때 추천 (검정·흰색·회색 공은 색 구분이 어려워 비추천)",
+                                value=True, key="trk_color_on")
+        color, marker = None, None
+        if use_color:
+            st.session_state.setdefault("trk_color", "#c8102e")
+            cc1, cc2 = st.columns([1, 2])
+            cc1.color_picker("공 색상", key="trk_color")
+            tol = cc2.slider("색상 허용 오차", 3, 40, 12, key="trk_tol",
+                             help="공이 일부만 초록색으로 표시되면 올리고, 바닥 등 다른 곳까지 표시되면 내리세요.")
+            sp1, sp2, sp3 = st.columns([2, 2, 2])
+            sp1.slider("색 따오기 위치 X (%)", 0.0, 100.0, 50.0, 0.1, key="trk_sx")
+            sp2.slider("색 따오기 위치 Y (%)", 0.0, 100.0, 50.0, 0.1, key="trk_sy")
+            sp3.button("📍 노란 원 위치의 색을 공 색으로", on_click=spd_pick_color, key="trk_pick",
+                       help="미리보기에서 공이 보이는 프레임을 고르고, X/Y로 노란 원을 공 위에 올린 뒤 누르세요.")
+            color = spd_color_params(st.session_state["trk_color"], tol)
+            marker = (st.session_state["trk_sx"], st.session_state["trk_sy"])
+        pin_box = (tuple(pin_x), tuple(pin_y)) if end_mode == END_MOTION else None
         if ref_img is not None:
-            st.image(spd_draw_lines(ref_img, y_foul, y_pin, lane_x), caption="기준선 미리보기")
+            pv1, pv2 = st.columns(2)
+            lines_img = spd_draw_lines(ref_img, y_foul, y_pin, lane_x, marker=marker, pin_box=pin_box)
+            pv1.image(lines_img, caption="기준선 미리보기")
+            if color is not None:
+                pv2.image(spd_color_preview(ref_img, color),
+                          caption="색 인식 미리보기 (초록 = 공 색으로 인식된 부분)")
+            with st.expander("🔍 기준선 확대 보기 (정밀하게 맞출 때)"):
+                z1, z2 = st.columns(2)
+                z1.image(spd_crop(lines_img, lane_x, y_foul), caption="파울라인 부근")
+                z2.image(spd_crop(lines_img, lane_x, y_pin), caption="핀 부근")
 
         st.markdown("**② 분석 설정**")
         t_lo, t_hi = st.slider("분석 구간 (초) — 투구 직전부터 핀에 닿은 직후까지", 0.0, float(duration),
                                (0.0, float(duration)), step=0.1, key="trk_range")
-        with st.expander("고급 설정 (공이 안 잡힐 때 조정)"):
-            var_thr = st.slider("움직임 감지 민감도 (작을수록 민감)", 4, 60, 20, key="trk_var")
+        var_thr = 20
+        if not use_color:
+            with st.expander("고급 설정 (공이 안 잡힐 때 조정)"):
+                var_thr = st.slider("움직임 감지 민감도 (작을수록 민감)", 4, 60, 20, key="trk_var")
 
-        valid_geo = abs(y_foul - y_pin) >= 20 and lane_x[0] < lane_x[1]
+        valid_geo = abs(y_foul - y_pin) >= 3 and lane_x[0] < lane_x[1]
         if not valid_geo:
-            st.warning("파울라인과 1번 핀 높이는 20% 이상 떨어져 있어야 하고, 레인 가로 범위의 시작값이 끝값보다 작아야 합니다.")
-        params = (int(y_foul), int(y_pin), tuple(lane_x), tuple(d_rng), int(var_thr), float(t_lo), float(t_hi))
+            st.warning("파울라인과 핀 쪽 기준은 3% 이상 떨어져 있어야 하고, 레인 가로 범위의 시작값이 끝값보다 작아야 합니다.")
+        params = (float(y_foul), end_mode, float(y_pin), tuple(lane_x), tuple(d_rng), int(var_thr),
+                  float(t_lo), float(t_hi), color, pin_box, pin_thr)
         if st.button("🎯 공 추적 실행", type="primary", key="trk_run", disabled=not valid_geo):
+            f_lo, f_hi = int(t_lo * fps), min(int(t_hi * fps), n - 1)
             with st.spinner("공을 추적하는 중..."):
-                cands = spd_track(video_path, tuple(lane_x), int(y_foul), int(y_pin), tuple(d_rng), int(var_thr),
-                                  int(t_lo * fps), min(int(t_hi * fps), n - 1))
-            st.session_state["trk_res"] = {"path": video_path, "cands": cands, "params": params}
+                cands = spd_track(video_path, tuple(lane_x), float(y_foul), float(y_pin), tuple(d_rng),
+                                  int(var_thr), f_lo, f_hi, color)
+                pin_series = None
+                if pin_box is not None:
+                    pin_series = spd_motion(video_path, pin_box, pin_box, 25, f_lo, f_hi,
+                                            max(1, int(round(fps / 30))))
+            st.session_state["trk_res"] = {"path": video_path, "cands": cands, "pin": pin_series, "params": params}
 
         res = st.session_state.get("trk_res")
         if res and res["path"] == video_path:
@@ -949,35 +1081,64 @@ with tab7:
                 if len(chain) < 6 or progress < 0.4 * span:
                     st.warning(
                         f"공의 궤적을 충분히 찾지 못했습니다 (후보 {len(res['cands'])}개). "
-                        "분석 구간을 투구 시점으로 좁히거나, 공 지름 범위/레인 가로 범위를 조정하거나, 민감도를 낮춰 보세요. "
-                        "계속 안 되면 '영역 변화 감지'나 '수동' 방식을 쓰세요.")
+                        "분석 구간을 투구 시점으로 좁히거나, 공 지름 범위·레인 가로 범위를 조정해 보세요. "
+                        "색상 추적이면 '색 인식 미리보기'에서 공이 초록색으로 보이는지 확인하고 색/허용 오차를 맞추세요. "
+                        "움직임 추적이면 민감도를 낮추거나 색상 추적을 써 보세요. 계속 안 되면 '수동' 방식을 쓰세요.")
                 else:
                     (ta, est_a), (tb, est_b) = spd_cross(chain, y_foul, y_pin, fps)
-                    mid_f = chain[len(chain) // 2][0]
-                    mid_img = spd_read_frame(video_path, int(mid_f))
+                    pin_fig = None
+                    if end_mode == END_MOTION:
+                        pidx, _, pmb = res["pin"]
+                        impact = spd_pin_impact(pidx, pmb, pin_thr, chain[0][0])
+                        tb, est_b = (None, False) if impact is None else ((impact - 0.5) / fps, False)
+                        pin_fig = go.Figure(go.Scatter(x=pidx / fps, y=pmb, mode="lines", name="핀 영역 변화",
+                                                       line=dict(color="#ff8c00")))
+                        pin_fig.add_hline(y=pin_thr, line_dash="dot", line_color="#888", annotation_text="감지 기준")
+                        if tb is not None:
+                            pin_fig.add_vline(x=tb, line_dash="dash", line_color="#ff8c00", annotation_text="핀 타격")
+                        pin_fig.update_layout(title="핀 영역의 움직임 (프레임 간 변화 %)", xaxis_title="영상 시간 (초)",
+                                              yaxis_title="변화 %", height=260, margin=dict(l=20, r=10, t=50, b=20))
+
+                    mid_img = spd_read_frame(video_path, int(chain[len(chain) // 2][0]))
                     if mid_img is not None:
-                        st.image(spd_draw_lines(mid_img, y_foul, y_pin, lane_x, chain),
+                        st.image(spd_draw_lines(mid_img, y_foul, y_pin, lane_x, chain, pin_box=pin_box),
                                  caption=f"추적된 공 궤적 (빨간 점 {len(chain)}개)")
 
-                    tt = [c[0] / fps for c in chain]
-                    yy = [c[2] for c in chain]
-                    fig_t = go.Figure(go.Scatter(x=tt, y=yy, mode="markers+lines", name="공 위치",
-                                                 line=dict(color="#d62728")))
+                    fig_t = go.Figure(go.Scatter(x=[c[0] / fps for c in chain], y=[c[2] for c in chain],
+                                                 mode="markers+lines", name="공 위치", line=dict(color="#d62728")))
                     fig_t.add_hline(y=y_foul, line_dash="dot", line_color="#1e90ff", annotation_text="파울라인")
-                    fig_t.add_hline(y=y_pin, line_dash="dot", line_color="#ff8c00", annotation_text="1번 핀")
+                    if end_mode == END_LINE:
+                        fig_t.add_hline(y=y_pin, line_dash="dot", line_color="#ff8c00", annotation_text="1번 핀")
                     fig_t.add_vline(x=ta, line_dash="dash", line_color="#1e90ff")
-                    fig_t.add_vline(x=tb, line_dash="dash", line_color="#ff8c00")
+                    if tb is not None:
+                        fig_t.add_vline(x=tb, line_dash="dash", line_color="#ff8c00")
                     fig_t.update_layout(title="시간에 따른 공의 화면 높이", xaxis_title="영상 시간 (초)",
                                         yaxis=dict(title="화면 높이 (%)", autorange="reversed"),
                                         height=320, margin=dict(l=20, r=10, t=50, b=20))
                     stretch(st.plotly_chart, fig_t)
+                    if pin_fig is not None:
+                        stretch(st.plotly_chart, pin_fig)
 
-                    st.success(f"파울라인 통과 {ta:.3f} 초 → 1번 핀 도달 {tb:.3f} 초")
-                    if est_a or est_b:
-                        st.caption("⚠️ 공이 기준선까지 찍히지 않아 일부 시각은 궤적을 연장해 추정한 값입니다. 결과가 이상하면 수동으로 확인하세요.")
-                    st.button("✋ 이 값을 수동 모드로 가져가 확인/미세 조정", on_click=spd_send_manual,
-                              args=(max(ta, 0.0), max(tb, 0.0), fps), key="trk_to_manual")
-                    elapsed = tb - ta
+                    if tb is None:
+                        st.warning("핀이 움직이는 순간을 찾지 못했습니다. 핀 영역 상자를 핀에 맞추거나 감지 기준을 낮춰 보세요.")
+                    else:
+                        how = "핀 움직임 감지" if end_mode == END_MOTION else "1번 핀 높이 선 통과"
+                        st.success(f"파울라인 통과 {ta:.3f} 초 → 핀 도달 {tb:.3f} 초 ({how})")
+                        if est_a or est_b:
+                            st.caption("⚠️ 공이 기준선까지 찍히지 않아 일부 시각은 궤적을 연장해 추정한 값입니다. 결과가 이상하면 수동으로 확인하세요.")
+                        # 기준선이 조금 어긋났을 때 결과가 얼마나 흔들리는지
+                        dlt, speeds = 0.3, []
+                        for dyf in (-dlt, 0.0, dlt):
+                            for dyp in ((-dlt, 0.0, dlt) if end_mode == END_LINE else (0.0,)):
+                                (ta2, _), (tb2, _) = spd_cross(chain, y_foul + dyf, y_pin + dyp, fps)
+                                tb2 = tb2 if end_mode == END_LINE else tb
+                                if tb2 - ta2 > 0.2:
+                                    speeds.append(lane_len / ((tb2 - ta2) / slow_factor) * 3.6)
+                        if speeds:
+                            st.caption(f"📐 기준선 높이가 화면 높이의 ±{dlt}% 어긋나면 구속이 약 {min(speeds):.1f} ~ {max(speeds):.1f} km/h 로 달라집니다.")
+                        st.button("✋ 이 값을 수동 모드로 가져가 확인/미세 조정", on_click=spd_send_manual,
+                                  args=(max(ta, 0.0), max(tb, 0.0), fps), key="trk_to_manual")
+                        elapsed = tb - ta
         else:
             st.info("기준선을 맞춘 뒤 **공 추적 실행**을 눌러 주세요.")
 
